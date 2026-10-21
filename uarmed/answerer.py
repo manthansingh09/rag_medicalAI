@@ -14,6 +14,8 @@ from sklearn.linear_model import LogisticRegression
 
 
 class AnswerModel:
+    name = "Classifier (TF-IDF + logistic regression)"
+
     def fit(self, questions):
         """Train on (question + its own abstract) -> correct answer."""
         texts = [q["question"] + " " + " ".join(q["contexts"]) for q in questions]
@@ -43,13 +45,17 @@ class AnswerModel:
         probabilities = self.predict_proba(question, passage_texts)
         return max(probabilities, key=probabilities.get)  # label with highest prob
 
-    def passage_stances(self, passage_texts):
+    def passage_stances(self, question, passage_texts):
         """Predict which answer EACH passage on its own points towards.
 
-        We call this once for the whole corpus and store the results. The
-        uncertainty module then checks whether retrieved passages "vote" for
-        the same answer (agreement) or for different answers (conflict).
+        The uncertainty module then checks whether the retrieved passages
+        "vote" for the same answer or for different answers (conflict).
+        This simple classifier was trained on whole abstracts, so it looks at
+        each passage alone and ignores `question`. The LLM answerer
+        (llm_answerer.py) does use the question.
         """
+        if len(passage_texts) == 0:
+            return np.array([])
         features = self.vectorizer.transform(passage_texts)
         predictions = self.classifier.predict(features)
         return np.array(predictions)  # one label per passage

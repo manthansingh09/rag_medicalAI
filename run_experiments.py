@@ -4,8 +4,9 @@ Usage:
     python run_experiments.py                  # BM25 retriever (default)
     python run_experiments.py --retriever TF-IDF
     python run_experiments.py --all            # all three retrievers
+    python run_experiments.py --answerer "Flan-T5 (LLM)"   # needs requirements-llm.txt
 
-Results are printed and saved to results/<retriever>.csv
+Results are printed and saved to results/<retriever>_<answerer>.csv
 """
 
 import argparse  # reads options typed after the script name
@@ -13,13 +14,13 @@ import os
 
 import pandas as pd
 
-from uarmed.pipeline import build_system, run_comparison, tune_on_validation
+from uarmed.pipeline import ANSWERERS, build_system, run_comparison, tune_on_validation
 from uarmed.retrievers import RETRIEVERS
 
 
-def run(retriever_name, start_k, step, budget, cost_weight):
-    print(f"\n=== Retriever: {retriever_name} ===")
-    system = build_system(retriever_name)
+def run(retriever_name, answerer_name, llm_name, start_k, step, budget, cost_weight):
+    print(f"\n=== Retriever: {retriever_name} | Answer model: {answerer_name} ===")
+    system = build_system(retriever_name, answerer_name, llm_name=llm_name)
     print(f"{len(system.passages)} passages | train {len(system.train)} | "
           f"val {len(system.val)} | test {len(system.test)}")
 
@@ -40,7 +41,8 @@ def run(retriever_name, start_k, step, budget, cost_weight):
           .round(3).to_string(index=False))
 
     os.makedirs("results", exist_ok=True)
-    file_name = retriever_name.replace(" ", "_").replace("(", "").replace(")", "")
+    # e.g. "Dense (LSA)" + "Classifier" -> "Dense_LSA_Classifier"
+    file_name = f"{retriever_name}_{answerer_name}".replace(" ", "_").replace("(", "").replace(")", "")
     table.to_csv(os.path.join("results", f"{file_name}.csv"), index=False)
 
 
@@ -48,6 +50,10 @@ if __name__ == "__main__":  # only runs when the file is executed directly
     parser = argparse.ArgumentParser(description="UAR-Med experiments")
     parser.add_argument("--retriever", default="BM25", choices=list(RETRIEVERS))
     parser.add_argument("--all", action="store_true", help="run every retriever")
+    # ANSWERERS contains "Flan-T5 (LLM)" only when torch + transformers are installed.
+    parser.add_argument("--answerer", default="Classifier", choices=list(ANSWERERS))
+    parser.add_argument("--llm", default=None,
+                        help="Hugging Face model name or folder, e.g. google/flan-t5-large")
     parser.add_argument("--start-k", type=int, default=3)
     parser.add_argument("--step", type=int, default=2)
     parser.add_argument("--budget", type=int, default=10)
@@ -56,4 +62,4 @@ if __name__ == "__main__":  # only runs when the file is executed directly
 
     names = list(RETRIEVERS) if args.all else [args.retriever]
     for name in names:
-        run(name, args.start_k, args.step, args.budget, args.cost_weight)
+        run(name, args.answerer, args.llm, args.start_k, args.step, args.budget, args.cost_weight)

@@ -12,12 +12,18 @@ Metrics (averaged over all test questions):
     answered          : share of questions answered (UAR-Med may abstain)
     accuracy answered : accuracy on only the answered questions
     unsafe answers    : share of questions answered WITHOUT any gold evidence
+
+Significance (each policy versus fixed top-5, on the same questions):
+    Δ accuracy        : accuracy difference
+    95% CI            : paired bootstrap confidence interval of that difference
+    p-value           : McNemar's test (p < 0.05 -> unlikely to be luck)
 """
 
 import itertools  # builds every combination of weights for the grid search
 import time  # measures latency
 
 import numpy as np
+from scipy.stats import binomtest  # exact test used for McNemar's test
 
 from .uncertainty import compute_signals
 
@@ -111,7 +117,7 @@ def precompute_rounds(questions, system, start_k, step, budget):
         rounds = []
         for k in schedule:
             # Weights (1, 1, 1) here are a placeholder; we only keep R, A, C.
-            s = compute_signals(ranked_ids[:k], ranked_scores[:k], system, (1, 1, 1))
+            s = compute_signals(q["question"], ranked_ids[:k], ranked_scores[:k], system, (1, 1, 1))
             texts = [system.passages[i]["text"] for i in ranked_ids[:k]]
             correct = system.answer_model.predict(q["question"], texts) == q["answer"]
             rounds.append({"k": k, "R": s["R"], "A": s["A"], "C": s["C"], "correct": correct})
@@ -166,3 +172,35 @@ def tune(table, budget, cost_weight=0.05, weight_grid=None, tau_grid=None):
                     "objective": objective,
                 }
     return best
+
+
+def compare_to_baseline(rows, baseline_rows, n_boot=2000, seed=0):
+    """Is a policy really better than the baseline, or just lucky?
+
+    Both lists of rows must cover the SAME questions in the SAME order, so we
+    can compare them question by question ("paired" comparison).
+    """
+    a = np.array([r["correct"] for r in rows], dtype=float)  # 1 = correct
+    b = np.array([r["correct"] for r in baseline_rows], dtype=float)
+
+    # 1) Paired bootstrap: resample the questions with replacement many times
+    #    and recompute the accuracy difference each time. The middle 95% of
+    #    those differences is the confidence interval.
+    rng = np.random.default_rng(seed)  # fixed seed -> same result every run
+    samples = rng.integers(0, len(a), size=(n_boot, len(a)))  # n_boot resamples
+    boot_diffs = a[samples].mean(axis=1) - b[samples].mean(axis=1)
+    ci_low, ci_high = np.percentile(boot_diffs, [2.5, 97.5])
+
+    # 2) McNemar's test: only questions where the two policies DISAGREE count.
+    #    If both were equally good, each would win about half of those.
+    only_a = int(((a == 1) & (b == 0)).sum())  # policy right, baseline wrong
+    only_b = int(((a == 0) & (b == 1)).sum())  # baseline right, policy wrong
+    disagreements = only_a + only_b
+    p_value = binomtest(only_a, disagreements, 0.5).pvalue if disagreements else 1.0
+
+    return {
+        "Δ accuracy": a.mean() - b.mean(),
+        "CI low": ci_low,
+        "CI high": ci_high,
+        "p-value": p_value,
+    }

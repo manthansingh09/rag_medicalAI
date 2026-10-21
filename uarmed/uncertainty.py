@@ -53,25 +53,25 @@ def raw_agreement(passage_ids, passage_vectors):
     return float(similarity[upper].mean())
 
 
-def conflict(passage_ids, passage_stances):
+def conflict(stances):
     """Fraction of passages that disagree with the majority answer vote.
 
     Example: stances = ["yes", "yes", "no", "yes"] -> majority "yes" (3 votes)
              conflict = 1 - 3/4 = 0.25
     """
-    if len(passage_ids) == 0:
+    if len(stances) == 0:
         return 0.0
-    stances = passage_stances[passage_ids]
     _, vote_counts = np.unique(stances, return_counts=True)  # votes per label
     return float(1.0 - vote_counts.max() / len(stances))
 
 
-def compute_signals(passage_ids, scores, system, weights):
+def compute_signals(question, passage_ids, scores, system, weights):
     """Compute R, A, C and U for one set of retrieved passages.
 
+    question    : the question text (the LLM answerer needs it for C)
     passage_ids : numbers of the retrieved passages
     scores      : their retrieval scores (same order)
-    system      : the MedRAGSystem (holds vectors, stances and references)
+    system      : the MedRAGSystem (holds vectors, answer model and references)
     weights     : (w1, w2, w3)
     """
     w1, w2, w3 = weights
@@ -80,7 +80,8 @@ def compute_signals(passage_ids, scores, system, weights):
     agreement = normalise(
         raw_agreement(passage_ids, system.passage_vectors), system.agreement_reference
     )
-    conflict_score = conflict(passage_ids, system.passage_stances)
+    texts = [system.passages[i]["text"] for i in passage_ids]
+    conflict_score = conflict(system.answer_model.passage_stances(question, texts))
 
     total_weight = w1 + w2 + w3
     if total_weight == 0:  # all weights zero -> no information -> stay unsure

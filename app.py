@@ -14,7 +14,7 @@ import pandas as pd  # tables
 import streamlit as st  # the web app framework
 
 from uarmed import policies
-from uarmed.pipeline import build_system, run_comparison, tune_on_validation
+from uarmed.pipeline import ANSWERERS, build_system, run_comparison, tune_on_validation
 from uarmed.retrievers import RETRIEVERS
 
 # Must be the first Streamlit command: sets the browser tab title and layout.
@@ -27,21 +27,22 @@ st.set_page_config(page_title="UAR-Med", page_icon="🩺", layout="wide")
 # means slow work (building the index, tuning) happens only once per setting.
 # ---------------------------------------------------------------------------
 @st.cache_resource(show_spinner="Building the search index and answer model...")
-def get_system(retriever_name):
+def get_system(retriever_name, answerer_name):
     # cache_resource: keep ONE shared object in memory (not copied each time).
-    return build_system(retriever_name)
+    return build_system(retriever_name, answerer_name)
 
 
 @st.cache_data(show_spinner="Tuning UAR-Med on the validation set...")
-def get_tuned(retriever_name, start_k, step, budget, cost_weight):
+def get_tuned(retriever_name, answerer_name, start_k, step, budget, cost_weight):
     # cache_data: remember the returned values for these exact arguments.
-    system = get_system(retriever_name)
+    system = get_system(retriever_name, answerer_name)
     return tune_on_validation(system, start_k, step, budget, cost_weight)
 
 
 @st.cache_data(show_spinner="Running every policy on the test set...")
-def get_comparison(retriever_name, weights, tau, threshold_tau, start_k, step, budget, abstain):
-    system = get_system(retriever_name)
+def get_comparison(retriever_name, answerer_name, weights, tau, threshold_tau,
+                   start_k, step, budget, abstain):
+    system = get_system(retriever_name, answerer_name)
     summaries, curve = run_comparison(
         system, weights, tau, threshold_tau, start_k, step, budget, abstain
     )
@@ -54,6 +55,9 @@ def get_comparison(retriever_name, weights, tau, threshold_tau, start_k, step, b
 st.sidebar.title("⚙️ Settings")
 
 retriever_name = st.sidebar.selectbox("Retriever", list(RETRIEVERS.keys()))
+# The LLM option appears only when torch + transformers are installed
+# (see requirements-llm.txt); free Streamlit hosting uses the classifier.
+answerer_name = st.sidebar.selectbox("Answer model", list(ANSWERERS.keys()))
 
 st.sidebar.subheader("Retrieval budget")
 start_k = st.sidebar.slider("Start with k passages", 1, 5, 3)
@@ -66,7 +70,9 @@ cost_weight = st.sidebar.slider(
     0.0, 0.3, 0.05, 0.01,
     help="Higher = tuning prefers settings that read fewer passages.",
 )
-best_uar, best_threshold = get_tuned(retriever_name, start_k, step, budget, cost_weight)
+best_uar, best_threshold = get_tuned(
+    retriever_name, answerer_name, start_k, step, budget, cost_weight
+)
 
 use_tuned = st.sidebar.checkbox("Use weights tuned on validation data", value=True)
 if use_tuned:
@@ -90,7 +96,7 @@ abstain = (
     else None
 )
 
-system = get_system(retriever_name)
+system = get_system(retriever_name, answerer_name)
 
 # ---------------------------------------------------------------------------
 # Page header and tabs
@@ -163,10 +169,12 @@ with tab_ask:
 
         st.subheader(f"3. Evidence used ({len(result.passage_ids)} passages)")
         gold = system.gold_ids[chosen["pmid"]] if chosen is not None else set()
-        for rank, passage_id in enumerate(result.passage_ids, start=1):
+        # Which answer each passage points to on its own (used for conflict C).
+        votes = system.answer_model.passage_stances(question_text, texts)
+        for rank, (passage_id, vote) in enumerate(zip(result.passage_ids, votes), start=1):
             passage = system.passages[passage_id]
             badge = " ✅ gold evidence" if passage_id in gold else ""
-            with st.expander(f"#{rank} · PMID {passage['pmid']} · vote: {system.passage_stances[passage_id]}{badge}"):
+            with st.expander(f"#{rank} · PMID {passage['pmid']} · vote: {vote}{badge}"):
                 st.write(passage["text"])
                 st.markdown(f"[Open on PubMed](https://pubmed.ncbi.nlm.nih.gov/{passage['pmid']}/)")
 
@@ -177,7 +185,8 @@ with tab_experiments:
     st.markdown(
         f"Every policy uses the **same {len(system.test)} test questions**, the same "
         f"corpus of **{len(system.passages):,} passages**, the same retriever "
-        f"(**{retriever_name}**) and the same answer model. Only the rule for "
+        f"(**{retriever_name}**) and the same answer model "
+        f"(**{system.answer_model.name}**). Only the rule for "
         "*how many passages to read* changes."
     )
     col1, col2 = st.columns(2)
@@ -199,26 +208,38 @@ with tab_experiments:
 
     if st.session_state.get("run_experiments"):
         table, curve = get_comparison(
-            retriever_name, tuple(weights), tau, best_threshold["tau"],
+            retriever_name, answerer_name, tuple(weights), tau, best_threshold["tau"],
             start_k, step, budget, abstain,
         )
 
         st.subheader("Results")
         percent = ["accuracy", "recall@k", "MRR", "evidence found", "answered",
                    "accuracy answered", "unsafe answers"]
+        quality = table.drop(columns=["retriever", "Δ accuracy", "CI low", "CI high", "p-value"])
         st.dataframe(
-            table.drop(columns="retriever").style.format(
+            quality.style.format(
                 {**{c: "{:.1%}" for c in percent},
                  "avg passages": "{:.2f}", "avg tokens": "{:.0f}", "latency (ms)": "{:.2f}"}
             ),
             hide_index=True,
             width="stretch",
         )
-        n = len(system.test)
-        margin = 1.96 * (0.5 * 0.5 / n) ** 0.5  # worst-case 95% margin of error
+
+        st.subheader("Is the difference real? (each policy vs fixed top-5)")
+        significance = table[["policy", "accuracy", "Δ accuracy", "CI low", "CI high", "p-value"]]
+        st.dataframe(
+            significance.style.format(
+                {"accuracy": "{:.1%}", "Δ accuracy": "{:+.1%}", "CI low": "{:+.1%}",
+                 "CI high": "{:+.1%}", "p-value": "{:.3f}"},
+                na_rep="baseline",
+            ),
+            hide_index=True,
+            width="stretch",
+        )
         st.caption(
-            f"With {n} questions, accuracy differences smaller than about "
-            f"±{margin:.1%} can be just luck. Look at cost and recall too."
+            "CI = 95% paired bootstrap confidence interval of the accuracy difference. "
+            "p-value from McNemar's test. If the CI contains 0 (or p ≥ 0.05), the "
+            "difference could be just luck."
         )
 
         st.subheader("Accuracy and recall versus retrieval cost")

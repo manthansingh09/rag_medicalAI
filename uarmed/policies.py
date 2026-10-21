@@ -52,7 +52,7 @@ def uar_med(question, system, weights, tau, start_k=3, step=2, budget=10):
     k = min(start_k, len(ranked_ids))  # how many passages we currently use
     steps = []  # a log of every round, shown in the app
     while True:
-        signals = compute_signals(ranked_ids[:k], ranked_scores[:k], system, weights)
+        signals = compute_signals(question, ranked_ids[:k], ranked_scores[:k], system, weights)
         stop = signals["U"] <= tau or k >= len(ranked_ids)
         steps.append({"k": k, **signals, "decision": "stop" if stop else "retrieve more"})
         if stop:

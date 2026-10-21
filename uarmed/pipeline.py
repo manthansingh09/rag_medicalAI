@@ -12,7 +12,8 @@ from sklearn.feature_extraction.text import TfidfVectorizer
 from . import policies
 from .answerer import AnswerModel
 from .data import build_corpus, gold_passage_ids, load_pubmedqa, split_questions
-from .evaluation import evaluate_policy, precompute_rounds, tune
+from .evaluation import compare_to_baseline, evaluate_policy, precompute_rounds, tune
+from .llm_answerer import LLMAnswerModel, llm_available
 from .retrievers import RETRIEVERS
 from .uncertainty import raw_agreement, raw_relevance
 
@@ -27,29 +28,41 @@ class MedRAGSystem:
     passages: list  # the corpus: every abstract part of every question
     gold_ids: dict  # pmid -> set of gold passage numbers
     retriever: object  # BM25 / TF-IDF / Dense (LSA)
-    answer_model: AnswerModel
+    answer_model: object  # AnswerModel or LLMAnswerModel
     passage_vectors: object  # TF-IDF vectors used for the agreement signal
-    passage_stances: np.ndarray  # yes/no/maybe vote of each single passage
     relevance_reference: float  # "typical high" relevance (for normalising R)
     agreement_reference: float  # "typical high" agreement (for normalising A)
 
 
-def build_system(retriever_name="BM25", seed=42):
-    """Load data, build the index, train the answerer, calibrate the scales."""
+# Answer models the user can pick. The LLM one is offered only when the
+# optional packages (torch + transformers) are installed.
+ANSWERERS = {"Classifier": AnswerModel}
+if llm_available():
+    ANSWERERS["Flan-T5 (LLM)"] = LLMAnswerModel
+
+
+def build_system(retriever_name="BM25", answerer_name="Classifier", seed=42, llm_name=None):
+    """Load data, build the index, train the answerer, calibrate the scales.
+
+    llm_name: optional Hugging Face model name or local folder for the LLM
+    answerer (default google/flan-t5-base).
+    """
     questions = load_pubmedqa()
     train, val, test = split_questions(questions, seed=seed)
     passages = build_corpus(questions)
     texts = [p["text"] for p in passages]
 
     retriever = RETRIEVERS[retriever_name]().fit(texts)  # build the search index
-    answer_model = AnswerModel().fit(train)  # learn yes/no/maybe
+    if answerer_name == "Flan-T5 (LLM)":
+        answer_model = LLMAnswerModel(llm_name) if llm_name else LLMAnswerModel()
+    else:
+        answer_model = ANSWERERS[answerer_name]()
+    answer_model.fit(train)  # learn yes/no/maybe (the LLM needs no training)
 
     # Separate TF-IDF vectors (length 1) used to compare passages with each
     # other for the agreement signal, whatever retriever is selected.
     vectorizer = TfidfVectorizer(stop_words="english", sublinear_tf=True)
     passage_vectors = vectorizer.fit_transform(texts)
-
-    passage_stances = answer_model.passage_stances(texts)
 
     # Calibration: look at the top-3 results for each TRAINING question and
     # record the raw relevance and agreement. The 95th percentile becomes the
@@ -69,7 +82,6 @@ def build_system(retriever_name="BM25", seed=42):
         retriever=retriever,
         answer_model=answer_model,
         passage_vectors=passage_vectors,
-        passage_stances=passage_stances,
         relevance_reference=float(np.percentile(relevances, 95)),
         agreement_reference=float(np.percentile(agreements, 95)),
     )
@@ -92,7 +104,8 @@ def run_comparison(system, weights, tau, threshold_tau, start_k=3, step=2, budge
                    abstain_threshold=None, questions=None):
     """Evaluate every policy on the same questions and return two lists.
 
-    summaries : one dict per policy (the main results table)
+    summaries : one dict per policy (the main results table), including the
+                significance test against fixed top-5
     curve     : fixed top-k for k = 1..budget (accuracy vs cost plot)
     """
     questions = system.test if questions is None else questions
@@ -118,13 +131,20 @@ def run_comparison(system, weights, tau, threshold_tau, start_k=3, step=2, budge
         ),
     ]
 
-    summaries = []
+    summaries, all_rows = [], {}
     for name, policy_fn in candidates:
         # Only UAR-Med is allowed to abstain; the others always answer.
         abstain = abstain_threshold if name == "UAR-Med (ours)" else None
-        summary, _ = evaluate_policy(name, policy_fn, questions, system, abstain)
+        summary, rows = evaluate_policy(name, policy_fn, questions, system, abstain)
         summary["retriever"] = system.retriever.name
         summaries.append(summary)
+        all_rows[name] = rows  # keep per-question results for the tests below
+
+    # Significance: compare every policy with fixed top-5 on the same questions.
+    for summary in summaries:
+        if summary["policy"] == "Fixed top-5":
+            continue  # comparing the baseline with itself means nothing
+        summary.update(compare_to_baseline(all_rows[summary["policy"]], all_rows["Fixed top-5"]))
 
     curve = []
     for k in range(1, budget + 1):

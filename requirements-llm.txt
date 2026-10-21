@@ -1,0 +1,6 @@
+# Extra packages for the optional Flan-T5 answer model (Colab / your own PC).
+# Not needed for the Streamlit deployment.
+-r requirements.txt
+torch>=2.0
+transformers>=4.40
+sentencepiece>=0.1.99
