@@ -19,6 +19,10 @@ from uarmed.pipeline import (
     ANSWERERS, build_live_system, build_system, run_comparison, tune_on_validation,
 )
 from uarmed.pubmed import search_pubmed
+from uarmed.safety import (
+    MIN_RELEVANCE, MIN_TOPIC_COVERAGE, MIN_VERDICT_CONFIDENCE, is_personal_question,
+    topic_coverage,
+)
 from uarmed.retrievers import RETRIEVERS
 
 # Must be the first Streamlit command: sets the browser tab title and layout.
@@ -153,7 +157,8 @@ with tab_ask:
             help="The offline library only covers the topics of 1,000 papers. "
                  "Live PubMed uses NCBI's free search service (no API key).",
         )
-        if question_text.strip() and source.startswith("Live"):
+        # Personal questions are refused below, so do not search for them.
+        if question_text.strip() and source.startswith("Live") and not is_personal_question(question_text):
             try:
                 articles = get_pubmed_articles(question_text)
             except Exception as error:  # no internet, NCBI busy, ...
@@ -165,26 +170,68 @@ with tab_ask:
                 ask_system = build_live_system(system, articles, question_text)
                 st.caption(f"Fetched {len(articles)} abstracts ({len(ask_system.passages)} passages) from PubMed.")
 
-    if question_text.strip():
+    # Safety check 1: research papers cannot diagnose or advise one person.
+    personal = bool(question_text.strip()) and is_personal_question(question_text)
+    if personal:
+        st.subheader("1. Answer")
+        st.error(
+            "**I can't answer questions about you personally.** This tool summarises "
+            "medical research papers; it cannot diagnose anyone or give personal "
+            "medical advice. Please talk to a doctor."
+        )
+        st.info(
+            "You can rephrase it as a general research question, for example "
+            "*\"What are the early symptoms of lung cancer?\"* or "
+            "*\"Is aspirin associated with stomach bleeding?\"*"
+        )
+
+    if question_text.strip() and not personal:
         result = policies.uar_med(question_text, ask_system, weights, tau, start_k, step, budget)
         texts = [ask_system.passages[i]["text"] for i in result.passage_ids]
         probabilities = ask_system.answer_model.predict_proba(question_text, texts)
         verdict = max(probabilities, key=probabilities.get)
         abstained = abstain is not None and result.uncertainty > abstain
         final_relevance = result.steps[-1]["R"]
+        # Safety check 2: are the question's key words in the evidence at all?
+        coverage, missing_terms = topic_coverage(question_text, texts)
+        in_database = coverage >= MIN_TOPIC_COVERAGE
+        # Safety check 3: strong evidence AND a sure model, or no yes/no verdict.
+        weak_evidence = final_relevance < MIN_RELEVANCE
+        confident = probabilities[verdict] >= MIN_VERDICT_CONFIDENCE and not weak_evidence
 
         # ---- 1. The answer ------------------------------------------------
         st.subheader("1. Answer")
-        if abstained:
+        if not in_database:
+            st.error(
+                "**Not found in the database.** The retrieved papers do not mention: "
+                f"*{', '.join(missing_terms)}*. No answer is given rather than a guess."
+                + ("" if ask_system is not system or chosen is not None else
+                   " Try **Live PubMed** under *Type my own*.")
+            )
+        elif abstained:
             st.error(f"Insufficient evidence (final U = {result.uncertainty:.2f}). No answer given.")
         else:
             # A yes/no verdict only makes sense for yes/no questions. Every
             # PubMedQA test question is one, even when phrased like a title.
             if chosen is not None or is_yes_no_question(question_text):
-                st.success(
-                    f"Short answer: **{verdict.upper()}** "
-                    f"(model confidence {probabilities[verdict]:.0%})"
-                )
+                if confident:
+                    st.success(
+                        f"Short answer: **{verdict.upper()}** "
+                        f"(model confidence {probabilities[verdict]:.0%})"
+                    )
+                elif weak_evidence:
+                    st.warning(
+                        "**No yes/no answer: the evidence is too weak.** The retrieved "
+                        f"passages match the question poorly (R = {final_relevance:.2f})."
+                    )
+                else:
+                    st.warning(
+                        "**The evidence is not clear enough for a yes/no answer** "
+                        f"(best guess {verdict} at only {probabilities[verdict]:.0%}). "
+                        "Read the summary and the sources below."
+                    )
+            if missing_terms:
+                st.caption(f"Not found in the evidence: {', '.join(missing_terms)}.")
             sentences = written_answer(question_text, result.passage_ids, ask_system.passages)
             if sentences:
                 # Each sentence is followed by its citation, e.g. "... [2]".
@@ -200,7 +247,7 @@ with tab_ask:
                 with st.spinner("Writing a summary with Flan-T5..."):
                     summary = ask_system.answer_model.generate_answer(question_text, texts)
                 st.markdown(f"**AI-written summary (Flan-T5):** {summary}")
-        if final_relevance < 0.3:
+        if in_database and weak_evidence:
             st.warning(
                 f"Weak evidence: the passages match your question poorly "
                 f"(R = {final_relevance:.2f}). The library may not cover this topic. "

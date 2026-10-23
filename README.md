@@ -70,7 +70,15 @@ In the **Ask a question** tab you get:
   a short paragraph, each with a citation like **[2]**. Nothing is invented,
   so every sentence can be traced to a real paper.
 - **A short yes/no/maybe verdict**, only for yes/no questions ("Does…", "Is…").
-- **A weak-evidence warning** when the passages match the question poorly.
+- **Safety checks** (`uarmed/safety.py`) that decide whether to answer at all:
+  - *Personal questions* ("Do I have cancer?", "Should I take…", "my…") are
+    refused: research papers cannot diagnose one person.
+  - *Not found in the database:* if the question's key words do not appear in
+    the retrieved papers, the app says so instead of guessing.
+  - *No verdict on weak evidence:* the yes/no verdict is shown only when the
+    passages match the question (R ≥ 0.3) and the model is at least 50% sure.
+    About 39% of test questions pass this bar; those verdicts are right more
+    often (60% vs 55% overall on test).
 - **Two places to search:** the offline PubMedQA library (1,000 abstracts), or
   **Live PubMed**, which uses NCBI's free E-utilities service (no key, no cost)
   and covers millions of abstracts. The same UAR-Med loop runs on the fetched
@@ -87,6 +95,7 @@ uarmed/
   answerer.py          yes/no/maybe classifier (TF-IDF + finding cues + logistic regression)
   explainer.py         writes the answer paragraph from evidence sentences, with citations
   pubmed.py            OPTIONAL live PubMed search (NCBI's free service, no key)
+  safety.py            when NOT to answer: personal questions, unknown topics, weak evidence
   llm_answerer.py      OPTIONAL zero-shot Flan-T5 answerer (needs torch + transformers)
   uncertainty.py       the R, A, C signals and the U formula
   policies.py          no retrieval, fixed top-k, threshold, UAR-Med loop
