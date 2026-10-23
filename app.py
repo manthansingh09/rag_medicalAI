@@ -4,7 +4,7 @@ Run locally with:      streamlit run app.py
 Deploy for free on:    https://share.streamlit.io (point it at this file)
 
 The app has three tabs:
-    1. Ask a question  -> watch the adaptive retrieval loop step by step
+    1. Ask a question  -> a written answer with citations, and the loop step by step
     2. Experiments     -> compare UAR-Med with the baselines on the test set
     3. How it works    -> the idea and the formula in plain words
 """
@@ -14,7 +14,11 @@ import pandas as pd  # tables
 import streamlit as st  # the web app framework
 
 from uarmed import policies
-from uarmed.pipeline import ANSWERERS, build_system, run_comparison, tune_on_validation
+from uarmed.explainer import is_yes_no_question, written_answer
+from uarmed.pipeline import (
+    ANSWERERS, build_live_system, build_system, run_comparison, tune_on_validation,
+)
+from uarmed.pubmed import search_pubmed
 from uarmed.retrievers import RETRIEVERS
 
 # Must be the first Streamlit command: sets the browser tab title and layout.
@@ -47,6 +51,12 @@ def get_comparison(retriever_name, answerer_name, weights, tau, threshold_tau,
         system, weights, tau, threshold_tau, start_k, step, budget, abstain
     )
     return pd.DataFrame(summaries), pd.DataFrame(curve)
+
+
+@st.cache_data(ttl=3600, show_spinner="Searching PubMed...")
+def get_pubmed_articles(question):
+    # ttl=3600: remember results for one hour, then search again.
+    return search_pubmed(question)
 
 
 # ---------------------------------------------------------------------------
@@ -117,12 +127,13 @@ tab_ask, tab_experiments, tab_about = st.tabs(
 )
 
 # ---------------------------------------------------------------------------
-# Tab 1: ask a single question and watch the loop
+# Tab 1: ask a single question, get a written answer, watch the loop
 # ---------------------------------------------------------------------------
 with tab_ask:
     mode = st.radio(
         "Question source", ["Pick from the test set", "Type my own"], horizontal=True
     )
+    ask_system = system  # the system (library) we search; may become live PubMed
     if mode == "Pick from the test set":
         # Show the first 100 test questions in a drop-down list.
         options = system.test[:100]
@@ -132,20 +143,79 @@ with tab_ask:
         question_text = chosen["question"]
     else:
         chosen = None  # a typed question has no known correct answer
-        question_text = st.text_input(
-            "Your question", "Does metformin reduce the risk of cardiovascular events?"
+        question_text = st.text_input("Your question", "What is melatonin used for?")
+        source = st.radio(
+            "Search in",
+            ["PubMedQA library (offline, 1,000 abstracts)",
+             "Live PubMed (internet, millions of abstracts)"],
+            index=1,  # live PubMed by default: it covers far more topics
+            horizontal=True,
+            help="The offline library only covers the topics of 1,000 papers. "
+                 "Live PubMed uses NCBI's free search service (no API key).",
         )
+        if question_text.strip() and source.startswith("Live"):
+            try:
+                articles = get_pubmed_articles(question_text)
+            except Exception as error:  # no internet, NCBI busy, ...
+                articles = None
+                st.error(f"Could not reach PubMed ({error}). Using the offline library instead.")
+            if articles == []:
+                st.warning("PubMed found no abstracts for this question. Using the offline library instead.")
+            if articles:
+                ask_system = build_live_system(system, articles, question_text)
+                st.caption(f"Fetched {len(articles)} abstracts ({len(ask_system.passages)} passages) from PubMed.")
 
     if question_text.strip():
-        result = policies.uar_med(question_text, system, weights, tau, start_k, step, budget)
-        texts = [system.passages[i]["text"] for i in result.passage_ids]
-        probabilities = system.answer_model.predict_proba(question_text, texts)
-        answer = max(probabilities, key=probabilities.get)
+        result = policies.uar_med(question_text, ask_system, weights, tau, start_k, step, budget)
+        texts = [ask_system.passages[i]["text"] for i in result.passage_ids]
+        probabilities = ask_system.answer_model.predict_proba(question_text, texts)
+        verdict = max(probabilities, key=probabilities.get)
         abstained = abstain is not None and result.uncertainty > abstain
+        final_relevance = result.steps[-1]["R"]
 
+        # ---- 1. The answer ------------------------------------------------
+        st.subheader("1. Answer")
+        if abstained:
+            st.error(f"Insufficient evidence (final U = {result.uncertainty:.2f}). No answer given.")
+        else:
+            # A yes/no verdict only makes sense for yes/no questions. Every
+            # PubMedQA test question is one, even when phrased like a title.
+            if chosen is not None or is_yes_no_question(question_text):
+                st.success(
+                    f"Short answer: **{verdict.upper()}** "
+                    f"(model confidence {probabilities[verdict]:.0%})"
+                )
+            sentences = written_answer(question_text, result.passage_ids, ask_system.passages)
+            if sentences:
+                # Each sentence is followed by its citation, e.g. "... [2]".
+                st.markdown(" ".join(f"{s['sentence']} **[{s['source']}]**" for s in sentences))
+                st.caption(
+                    "Sentences are taken word-for-word from the evidence below; "
+                    "the number in brackets is the source passage."
+                )
+            else:
+                st.info("No sentence in the retrieved evidence matches the question well.")
+            # The optional LLM can also write its own summary.
+            if hasattr(ask_system.answer_model, "generate_answer"):
+                with st.spinner("Writing a summary with Flan-T5..."):
+                    summary = ask_system.answer_model.generate_answer(question_text, texts)
+                st.markdown(f"**AI-written summary (Flan-T5):** {summary}")
+        if final_relevance < 0.3:
+            st.warning(
+                f"Weak evidence: the passages match your question poorly "
+                f"(R = {final_relevance:.2f}). The library may not cover this topic. "
+                "Try **Live PubMed** under *Type my own*."
+            )
+        if chosen is not None:
+            st.info(
+                f"Expert answer from PubMedQA: **{chosen['answer'].upper()}**. "
+                f"Paper's conclusion: {chosen['long_answer']}"
+            )
+
+        # ---- 2. How the system decided -------------------------------------
         left, right = st.columns([3, 2])
         with left:
-            st.subheader("1. The adaptive retrieval loop")
+            st.subheader("2. The adaptive retrieval loop")
             steps = pd.DataFrame(result.steps)
             st.dataframe(
                 steps.style.format({"R": "{:.2f}", "A": "{:.2f}", "C": "{:.2f}", "U": "{:.2f}"}),
@@ -157,24 +227,20 @@ with tab_ask:
                 f"or the budget of {budget} passages is reached."
             )
         with right:
-            st.subheader("2. Answer")
-            if abstained:
-                st.error(f"Insufficient evidence (final U = {result.uncertainty:.2f}). No answer given.")
-            else:
-                st.success(f"Predicted answer: **{answer.upper()}**")
-            if chosen is not None:
-                st.info(f"Expert answer from PubMedQA: **{chosen['answer'].upper()}**")
+            st.subheader("Yes / no / maybe scores")
             prob_df = pd.DataFrame({"answer": list(probabilities), "probability": list(probabilities.values())})
             st.bar_chart(prob_df, x="answer", y="probability", height=200)
 
+        # ---- 3. The evidence ---------------------------------------------
         st.subheader(f"3. Evidence used ({len(result.passage_ids)} passages)")
-        gold = system.gold_ids[chosen["pmid"]] if chosen is not None else set()
+        gold = ask_system.gold_ids[chosen["pmid"]] if chosen is not None else set()
         # Which answer each passage points to on its own (used for conflict C).
-        votes = system.answer_model.passage_stances(question_text, texts)
+        votes = ask_system.answer_model.passage_stances(question_text, texts)
         for rank, (passage_id, vote) in enumerate(zip(result.passage_ids, votes), start=1):
-            passage = system.passages[passage_id]
+            passage = ask_system.passages[passage_id]
             badge = " ✅ gold evidence" if passage_id in gold else ""
-            with st.expander(f"#{rank} · PMID {passage['pmid']} · vote: {vote}{badge}"):
+            title = f" · {passage['title'][:80]}" if passage.get("title") else ""
+            with st.expander(f"[{rank}] PMID {passage['pmid']}{title} · vote: {vote}{badge}"):
                 st.write(passage["text"])
                 st.markdown(f"[Open on PubMed](https://pubmed.ncbi.nlm.nih.gov/{passage['pmid']}/)")
 
@@ -213,7 +279,7 @@ with tab_experiments:
         )
 
         st.subheader("Results")
-        percent = ["accuracy", "recall@k", "MRR", "evidence found", "answered",
+        percent = ["accuracy", "macro F1", "recall@k", "MRR", "evidence found", "answered",
                    "accuracy answered", "unsafe answers"]
         quality = table.drop(columns=["retriever", "Δ accuracy", "CI low", "CI high", "p-value"])
         st.dataframe(

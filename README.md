@@ -58,8 +58,23 @@ using a 95% paired bootstrap confidence interval and McNemar's test, so you can
 tell a real improvement from luck.
 
 **Answer models:** the default is a small TF-IDF + logistic-regression classifier
-(fast, deploys anywhere). An optional zero-shot **Flan-T5** answerer
+with extra "finding phrase" features such as *no significant difference* or
+*significantly reduced* (fast, deploys anywhere). An optional zero-shot **Flan-T5** answerer
 (`uarmed/llm_answerer.py`) can be switched on in Colab; see section 4.
+
+## What the app answers
+
+In the **Ask a question** tab you get:
+
+- **A written answer.** The best-matching sentences from the evidence, joined into
+  a short paragraph, each with a citation like **[2]**. Nothing is invented,
+  so every sentence can be traced to a real paper.
+- **A short yes/no/maybe verdict**, only for yes/no questions ("Does…", "Is…").
+- **A weak-evidence warning** when the passages match the question poorly.
+- **Two places to search:** the offline PubMedQA library (1,000 abstracts), or
+  **Live PubMed**, which uses NCBI's free E-utilities service (no key, no cost)
+  and covers millions of abstracts. The same UAR-Med loop runs on the fetched
+  papers. If PubMed cannot be reached, the app falls back to the library.
 
 ## 3. Project structure
 
@@ -69,7 +84,9 @@ run_experiments.py     same experiment from the command line / Colab
 uarmed/
   data.py              load PubMedQA, build the passage corpus, split train/val/test
   retrievers.py        TF-IDF, BM25 (written from scratch), Dense (LSA)
-  answerer.py          yes/no/maybe classifier (TF-IDF + logistic regression)
+  answerer.py          yes/no/maybe classifier (TF-IDF + finding cues + logistic regression)
+  explainer.py         writes the answer paragraph from evidence sentences, with citations
+  pubmed.py            OPTIONAL live PubMed search (NCBI's free service, no key)
   llm_answerer.py      OPTIONAL zero-shot Flan-T5 answerer (needs torch + transformers)
   uncertainty.py       the R, A, C signals and the U formula
   policies.py          no retrieval, fixed top-k, threshold, UAR-Med loop
@@ -134,32 +151,32 @@ because every policy uses the same model.
 
 ## 5. First results (BM25, 300 test questions, default settings)
 
-| Policy | Accuracy | Recall@k | Evidence found | Avg passages | Δ acc vs top-5 [95% CI] | McNemar p |
+| Policy | Accuracy | Macro F1 | Recall@k | Avg passages | Δ acc vs top-5 [95% CI] | McNemar p |
 |---|---|---|---|---|---|---|
-| No retrieval | 53.3% | 0.0% | 0.0% | 0.00 | −0.7 [−3.0, +1.3] | 0.75 |
-| Fixed top-3 | 54.0% | 62.3% | 98.3% | 3.00 | 0.0 [−1.7, +1.7] | 1.00 |
-| Fixed top-5 | 54.0% | 69.0% | 98.7% | 5.00 | baseline | – |
-| Fixed top-10 | 53.3% | 75.2% | 99.0% | 10.00 | −0.7 [−3.3, +1.7] | 0.79 |
-| Threshold (R only) | 54.0% | 62.5% | 98.7% | 3.12 | 0.0 [−1.7, +1.7] | 1.00 |
-| UAR-Med (ours) | 54.3% | 62.6% | 98.3% | 3.15 | +0.3 [−1.0, +2.0] | 1.00 |
+| No retrieval | 54.0% | 0.32 | 0.0% | 0.00 | +5.3 [−0.7, +11.3] | 0.13 |
+| Fixed top-3 | 54.7% | 0.41 | 62.3% | 3.00 | +6.0 [+1.3, +10.7] | 0.02 |
+| Fixed top-5 | 48.7% | 0.39 | 69.0% | 5.00 | baseline | – |
+| Fixed top-10 | 48.0% | 0.39 | 75.2% | 10.00 | −0.7 [−6.3, +5.0] | 0.91 |
+| Threshold (R only) | 55.0% | 0.42 | 63.2% | 3.35 | +6.3 [+1.3, +11.0] | 0.01 |
+| UAR-Med (ours) | 55.0% | 0.42 | 63.2% | 3.35 | +6.3 [+1.3, +11.0] | 0.01 |
 
 **How to read this:**
 
-- The adaptive methods match fixed top-5 accuracy while reading ~37% fewer
-  passages, and match top-10 accuracy with ~69% fewer. The cost is lower recall
-  (62.6% vs 69.0% for top-5), because most questions stop after 3 passages.
-- The accuracy differences are **not significant**: every confidence interval
-  contains 0 and every p-value is far above 0.05. They are not evidence that
-  one policy answers better.
-- Watch out for a lucky baseline. With the Dense (LSA) retriever, top-5 happens
-  to be unusually weak (51.7%), so UAR-Med looks significantly better than it
-  (p = 0.004). But UAR-Med is no better than top-3 there, so this is not a real win.
-- The bottleneck is the answer model. A bag-of-words classifier stays close to
-  the "always say yes" rate (53.7% on this split), so extra evidence barely changes
-  its answers. The retrieval metrics (recall, evidence found, cost) are the
-  meaningful part of these results.
-- The conflict signal C is weak for the same reason: the classifier votes "yes"
-  for about 93% of single passages.
+- **More passages is not always better.** With this answer model, accuracy
+  drops after about 3-4 passages: extra passages come from *other* papers and
+  add misleading phrases. Adaptive retrieval beats fixed top-5 by 6.3 points
+  (significant, p = 0.01) while reading 33% fewer passages.
+- **But it does not beat a well-chosen fixed k.** UAR-Med is about equal to
+  fixed top-3. On BM25 the tuning chose weights (0.5, 0, 0), i.e. relevance
+  only, which is why it matches the threshold baseline exactly. With TF-IDF it
+  used conflict only and did slightly worse than top-3. So the extra signals
+  A and C have not proven useful yet.
+- **The answer model is still the bottleneck.** Its accuracy with the paper's
+  own abstract is only about 59%. A plain classifier said "yes" for 296 of
+  300 questions; finding-phrase features and balanced class weights fixed that
+  (now 196 yes / 82 no / 22 maybe), which raised macro F1 from 0.25 to 0.41.
+- Watch out for a lucky baseline: always compare against the best fixed k,
+  not only top-5.
 
 ## 6. Next steps (in order)
 

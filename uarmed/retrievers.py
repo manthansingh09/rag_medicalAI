@@ -129,8 +129,11 @@ class DenseLSARetriever(BaseRetriever):
     def fit(self, texts):
         self.vectorizer = TfidfVectorizer(stop_words="english", sublinear_tf=True)
         tfidf = self.vectorizer.fit_transform(texts)
+        # A small corpus (e.g. live PubMed results) cannot have more dense
+        # dimensions than it has passages or words, so we cap the number.
+        n_components = min(self.n_components, tfidf.shape[0] - 1, tfidf.shape[1] - 1)
         # random_state fixes the randomness so results are repeatable.
-        self.svd = TruncatedSVD(n_components=self.n_components, random_state=0)
+        self.svd = TruncatedSVD(n_components=max(n_components, 1), random_state=0)
         # fit_transform learns the compression and applies it to all passages,
         # then normalize() makes every vector length 1 for cosine similarity.
         self.vectors = normalize(self.svd.fit_transform(tfidf))

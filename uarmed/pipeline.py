@@ -87,6 +87,38 @@ def build_system(retriever_name="BM25", answerer_name="Classifier", seed=42, llm
     )
 
 
+def build_live_system(base, articles, question):
+    """Make a small system over live PubMed articles, reusing the base system's
+    answer model and settings. The same UAR-Med loop can then run on it.
+
+    question: the user's question. The relevance scale of the big library does
+    not fit a 20-paper corpus, so here R measures how close each passage
+    scores to the BEST passage for this question.
+    """
+    passages = [
+        {"pmid": a["pmid"], "position": i, "text": text, "title": a["title"]}
+        for a in articles
+        for i, text in enumerate(a["contexts"])
+    ]
+    texts = [p["text"] for p in passages]
+    retriever = type(base.retriever)().fit(texts)  # same kind of retriever, new index
+    vectorizer = TfidfVectorizer(stop_words="english", sublinear_tf=True)
+    best_score = float(retriever.score(question).max())
+
+    return MedRAGSystem(
+        train=base.train,
+        val=base.val,
+        test=[],
+        passages=passages,
+        gold_ids=gold_passage_ids(passages),
+        retriever=retriever,
+        answer_model=base.answer_model,
+        passage_vectors=vectorizer.fit_transform(texts),
+        relevance_reference=best_score if best_score > 0 else 1.0,
+        agreement_reference=base.agreement_reference,
+    )
+
+
 def tune_on_validation(system, start_k=3, step=2, budget=10, cost_weight=0.05):
     """Tune UAR-Med AND the threshold baseline on the validation set.
 

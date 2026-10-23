@@ -89,6 +89,19 @@ class LLMAnswerModel:
         probabilities = self.predict_proba(question, passage_texts)
         return max(probabilities, key=probabilities.get)
 
+    def generate_answer(self, question, passage_texts, max_new_tokens=120):
+        """Write a short free-text answer (used in the app's answer box)."""
+        context = " ".join(" ".join(passage_texts).split()[: self.max_context_words])
+        prompt = (
+            "Using only the context, answer the question in two or three sentences.\n"
+            f"Context: {context}\nQuestion: {question}"
+        )
+        inputs = self.tokenizer(prompt, return_tensors="pt", truncation=True, max_length=512)
+        inputs = {name: tensor.to(self.device) for name, tensor in inputs.items()}
+        with self.torch.no_grad():
+            output_ids = self.model.generate(**inputs, max_new_tokens=max_new_tokens)
+        return self.tokenizer.decode(output_ids[0], skip_special_tokens=True)
+
     def passage_stances(self, question, passage_texts):
         """Ask the model to answer from EACH passage alone (used for conflict C)."""
         return [self.predict(question, [text]) for text in passage_texts]

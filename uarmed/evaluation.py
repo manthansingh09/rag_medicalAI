@@ -2,6 +2,8 @@
 
 Metrics (averaged over all test questions):
     accuracy          : how often the predicted answer equals the true answer
+    macro F1          : F1 score of yes, no and maybe, averaged. A model that
+                        always says "yes" gets good accuracy but a low macro F1
     recall@k          : share of the gold passages that were retrieved
     MRR               : 1 / (rank of the first gold passage); 0 if none found
     evidence found    : share of questions where at least one gold passage
@@ -24,6 +26,7 @@ import time  # measures latency
 
 import numpy as np
 from scipy.stats import binomtest  # exact test used for McNemar's test
+from sklearn.metrics import f1_score
 
 from .uncertainty import compute_signals
 
@@ -84,6 +87,10 @@ def summarise(name, rows):
     return {
         "policy": name,
         "accuracy": np.mean([r["correct"] for r in rows]),
+        "macro F1": f1_score(
+            [r["true answer"] for r in rows], [r["prediction"] for r in rows],
+            average="macro", labels=["yes", "no", "maybe"], zero_division=0,
+        ),
         "recall@k": np.mean([r["recall"] for r in rows]),
         "MRR": np.mean([r["rr"] for r in rows]),
         "evidence found": np.mean([r["evidence found"] for r in rows]),
